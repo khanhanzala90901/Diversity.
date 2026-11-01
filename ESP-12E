@@ -1,75 +1,396 @@
-ESP32-LoRa-Chat
-A web-based chat application using ESP32 and LoRa communication for long-range wireless messaging.
+#include <SPI.h>
+#include <LoRa.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 
-🌟 Features
-💬 Real-time messaging over LoRa
-🌐 Web-based interface accessible via WiFi
-📡 Long-range communication using SX1278 LoRa Module Ra-02
-📱 Mobile-friendly responsive design
-🔄 Automatic message synchronization
-📊 Message history storage
-🚦 Connection status indicators
-⚡ Easy setup and configuration
-📋 Hardware Requirements
-ESP32 Development Board
-SX1278 LoRa Module Ra-02
-433MHz Spring Antenna
-Center frequency: 433MHz
-Gain: 3dBi
-Input impedance: 50 ohm
-Interface: IPX1
-🔌 Wire Connections
-ESP32 -> LoRa Module
-- GPIO5  -> NSS/CS
-- GPIO18 -> SCK
-- GPIO19 -> MISO
-- GPIO23 -> MOSI
-🚀 Setup Instructions
-Install Required Libraries:
+// ---------- Pins for NodeMCU V3 (GPIO numbers) ----------
+// Ra-02 SCK  -> D5 (GPIO14)   hardware SPI, fixed
+// Ra-02 MISO -> D6 (GPIO12)   hardware SPI, fixed
+// Ra-02 MOSI -> D7 (GPIO13)   hardware SPI, fixed
+#define LORA_SS    15   // Ra-02 NSS  -> D8
+#define LORA_RST   16   // Ra-02 RST  -> D0
+#define LORA_DIO0  4    // Ra-02 DIO0 -> D2
 
-WiFi.h
-WebServer.h
-ArduinoJson
-SPI.h
-LoRa.h
-SPIFFS.h
-Upload Code:
+// ---------- Optional parts (nothing happens if not connected) ----------
+#define BUZZER_PIN   5   // D1: buzzer + to D1, - to GND
+#define SOS_BTN_PIN  0   // D3: push button between D3 and GND (the onboard FLASH button also works)
 
-Download the code from this repository
-Open in Arduino IDE
-Select ESP32 board
-Upload to two ESP32 devices
-For second device, change LoRa addresses in code:
-// First ESP32
-byte localAddress = 0xAA;    
-byte destination = 0xBB;     
+// ---------- Settings (must be the SAME on all devices) ----------
+#define LORA_FREQ   433E6   // Ra-02 = 433 MHz. Change only if your module is different
+#define START_TTL   4       // message can jump 4 times
+#define MAX_TEXT    160     // max bytes of message text
+#define MAX_MSG     20      // messages kept in memory (ESP8266 has less RAM)
+#define SEEN_SIZE   40      // message IDs remembered (to stop loops)
+#define RELAY_Q     6       // messages waiting to be forwarded
 
-// Second ESP32
-byte localAddress = 0xBB;    
-byte destination = 0xAA;     
-Connect:
+ESP8266WebServer server(80);
+String nodeId;
+bool loraOk = false;   // becomes true when the LoRa module starts correctly
 
-Network name: ESP32-LoRa-Chat
-Password: chatpass123
-Web interface: 192.168.4.1
-💻 Usage
-Power on both ESP32 devices
-Connect to either ESP32's WiFi network
-Open web browser and go to 192.168.4.1
-Enter username in the prompt
-Start chatting!
-📡 Hardware Specifications
-LoRa Module (SX1278 Ra-02)
-Frequency: 433MHz
-Spreading Factor: 10
-Bandwidth: 125kHz
-Coding Rate: 4/5
-Maximum Range: Several kilometers (line of sight)
-Antenna Specifications
-Type: Spring Antenna
-Center Frequency: 433MHz
-VSWR: ≤1.5
-Gain: 3dBi
-Maximum Power: 10W
-Input Impedance: 50 ohm
-Interface: IPX1
+// ---------- Message storage ----------
+struct Msg {
+  String from;
+  String text;
+  bool sos;
+  bool mine;
+  int rssi;
+};
+Msg msgs[MAX_MSG];
+uint32_t msgSeq = 0;
+
+uint32_t seenIDs[SEEN_SIZE];
+int seenPos = 0;
+
+struct Relay {
+  String pkt;
+  unsigned long due;
+  bool used;
+};
+Relay relayQ[RELAY_Q];
+
+// ---------- Web page ----------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Disaster Messenger</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:sans-serif;margin:0;background:#f2f2f2;color:#222}
+header{background:#0b5ed7;color:#fff;padding:10px 12px;font-size:14px}
+header b{font-size:17px}
+#log{height:36vh;overflow-y:auto;padding:8px}
+.m{background:#fff;border-radius:8px;padding:6px 10px;margin:6px 0;max-width:90%}
+.m.me{background:#d6e8ff;margin-left:auto}
+.m.sos{background:#ffd6d6;border:2px solid #d00}
+.m small{color:#666;display:block}
+.bar{padding:8px}
+input{width:100%;padding:10px;font-size:16px;margin:3px 0;border:1px solid #aaa;border-radius:6px}
+button{padding:10px;font-size:15px;border:0;border-radius:6px;background:#0b5ed7;color:#fff;margin:2px}
+button.q{background:#444}
+#sos{background:#d00;width:100%;font-size:20px;padding:14px;font-weight:bold}
+.row{display:flex;gap:4px}
+.row input{flex:1}
+.hint{font-size:12px;color:#555}
+</style></head><body>
+<header><b>Disaster Messenger</b><br>Your ID: <b id="id">----</b> &nbsp;|&nbsp; <span id="st">Connecting...</span></header>
+<div id="log"></div>
+<div class="bar">
+<button id="sos" onclick="sendSOS()">SOS - NEED HELP</button>
+<div id="quick"></div>
+<input id="nm" placeholder="Your name" maxlength="16">
+<input id="to" placeholder="Send to ID (empty = everyone)" maxlength="8">
+<div class="row"><input id="txt" placeholder="Type, or tap the keyboard mic to speak" maxlength="160"><button onclick="sendText()">Send</button></div>
+<button id="vb" onclick="toggleVoice()">Voice reading: OFF (tap to turn on)</button>
+<div class="hint">Tip: tap a received message to reply to that person only.</div>
+</div>
+<script>
+var last=0,first=true,voice=false;
+function $(i){return document.getElementById(i)}
+var Q=["Need doctor","Need food","Need water","Flood here","Fire here","Road blocked","Need rescue","I am safe"];
+Q.forEach(function(t){var b=document.createElement('button');b.className='q';b.textContent=t;b.onclick=function(){send(t,'M')};$('quick').appendChild(b)});
+try{$('nm').value=localStorage.getItem('nm')||''}catch(e){}
+
+function send(t,type){
+  var nm=$('nm').value.trim();
+  try{localStorage.setItem('nm',nm)}catch(e){}
+  var u='/send?type='+type+'&nm='+encodeURIComponent(nm)+'&to='+encodeURIComponent($('to').value)+'&text='+encodeURIComponent(t);
+  fetch(u).then(function(r){if(!r.ok)throw 0;$('st').textContent='Sent';poll()}).catch(function(){$('st').textContent='Send failed'});
+}
+function sendText(){var t=$('txt').value;if(!t.trim())return;send(t,'M');$('txt').value=''}
+function sendSOS(){if(confirm('Send SOS to everyone?'))send('SOS! Need help','S')}
+function say(t,urgent){try{if(urgent)speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}catch(e){}}
+function toggleVoice(){voice=!voice;$('vb').textContent=voice?'Voice reading: ON':'Voice reading: OFF (tap to turn on)';if(voice)say('Voice is on',false)}
+
+function show(f){
+  var sos=f[1]=='S',mine=f[2]=='1',from=f[4],text=f[5]||'';
+  var d=document.createElement('div');
+  d.className='m'+(mine?' me':'')+(sos?' sos':'');
+  var s=document.createElement('small');
+  s.textContent=(sos?'SOS from ':'')+(mine?'You':from)+(mine?'':'  ('+f[3]+' dBm)');
+  var p=document.createElement('div');p.textContent=text;
+  d.appendChild(s);d.appendChild(p);
+  d.onclick=function(){var i=from.lastIndexOf('@');if(i>=0&&!mine)$('to').value=from.slice(i+1)};
+  var lg=$('log');lg.appendChild(d);lg.scrollTop=lg.scrollHeight;
+  if(!mine&&!first){
+    if(voice)say((sos?'S O S! ':'')+from.split('@')[0]+' says '+text,sos);
+    if(sos&&navigator.vibrate)navigator.vibrate([400,200,400]);
+  }
+}
+
+function poll(){
+  fetch('/poll?since='+last).then(function(r){return r.text()}).then(function(t){
+    var L=t.split('\n'),h=L[0].split('\t');
+    $('id').textContent=h[0];$('st').textContent=(h[2]=='0')?'LoRa NOT working - check wiring':'Connected';
+    var seq=parseInt(h[1]);
+    if(seq<last){$('log').innerHTML='';last=0;first=true}
+    for(var i=1;i<L.length;i++){
+      if(!L[i])continue;
+      var f=L[i].split('\t'),n=parseInt(f[0]);
+      if(n<=last)continue;
+      last=n;show(f);
+    }
+    first=false;
+  }).catch(function(){$('st').textContent='Not connected to device'});
+}
+setInterval(poll,2000);poll();
+</script></body></html>
+)rawliteral";
+
+// ---------- Helper functions ----------
+void beep(int times, int onMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(80);
+  }
+}
+
+// Remove characters that break our packet format and cut to max bytes
+String clean(String s, int maxBytes) {
+  s.replace("|", " ");
+  s.replace("\r", " ");
+  s.replace("\n", " ");
+  s.replace("\t", " ");
+  s.trim();
+  if ((int)s.length() > maxBytes) {
+    int cut = maxBytes;
+    // do not cut in the middle of a Hindi/Kannada (UTF-8) letter
+    while (cut > 0 && (((uint8_t)s[cut]) & 0xC0) == 0x80) cut--;
+    s = s.substring(0, cut);
+  }
+  return s;
+}
+
+bool alreadySeen(uint32_t id) {
+  for (int i = 0; i < SEEN_SIZE; i++) {
+    if (seenIDs[i] == id) return true;
+  }
+  return false;
+}
+
+void rememberID(uint32_t id) {
+  seenIDs[seenPos] = id;
+  seenPos = (seenPos + 1) % SEEN_SIZE;
+}
+
+void addMessage(const String &from, const String &text, bool sos, bool mine, int rssi) {
+  Msg &m = msgs[msgSeq % MAX_MSG];
+  m.from = from;
+  m.text = text;
+  m.sos = sos;
+  m.mine = mine;
+  m.rssi = rssi;
+  msgSeq++;
+}
+
+// Packet format:  ID|FROM|TO|TTL|TYPE|TEXT      (TYPE: M = message, S = SOS)
+String buildPacket(uint32_t id, const String &from, const String &to, int ttl, const char *type, const String &text) {
+  char idb[9];
+  sprintf(idb, "%08X", (unsigned int)id);
+  return String(idb) + "|" + from + "|" + to + "|" + String(ttl) + "|" + type + "|" + text;
+}
+
+void transmit(const String &pkt) {
+  if (!loraOk) return;
+  LoRa.beginPacket();
+  LoRa.print(pkt);
+  LoRa.endPacket();
+}
+
+void queuePacket(const String &pkt, unsigned long delayMs) {
+  for (int i = 0; i < RELAY_Q; i++) {
+    if (!relayQ[i].used) {
+      relayQ[i].pkt = pkt;
+      relayQ[i].due = millis() + delayMs;
+      relayQ[i].used = true;
+      return;
+    }
+  }
+  // queue full: drop
+}
+
+void sendDueRelays() {
+  for (int i = 0; i < RELAY_Q; i++) {
+    if (relayQ[i].used && (long)(millis() - relayQ[i].due) >= 0) {
+      transmit(relayQ[i].pkt);
+      relayQ[i].used = false;
+    }
+  }
+}
+
+// Send a new message from this device
+void sendMessage(String name, String to, String text, bool sos) {
+  name = clean(name, 16);
+  if (name.length() == 0) name = "User";
+  to = clean(to, 8);
+  to.toUpperCase();
+  if (to.length() == 0 || sos) to = "ALL";
+  text = clean(text, MAX_TEXT);
+  if (text.length() == 0) return;
+
+  String from = name + "@" + nodeId;
+  uint32_t id = RANDOM_REG32;   // hardware random number
+  if (id == 0) id = 1;
+  rememberID(id);
+
+  String pkt = buildPacket(id, from, to, START_TTL, sos ? "S" : "M", text);
+  transmit(pkt);
+  if (sos) queuePacket(pkt, 3000);   // SOS is sent a second time after 3 seconds
+
+  addMessage(from, text, sos, true, 0);
+  Serial.println("SENT  -> " + pkt);
+}
+
+// ---------- Receive from LoRa ----------
+void receiveLoRa() {
+  if (!loraOk) return;
+  int size = LoRa.parsePacket();
+  if (size <= 0) return;
+
+  String msg = "";
+  while (LoRa.available()) msg += (char)LoRa.read();
+  int rssi = LoRa.packetRssi();
+
+  int idx[5];
+  int p = -1;
+  for (int i = 0; i < 5; i++) {
+    p = msg.indexOf('|', p + 1);
+    if (p < 0) return;            // not our packet
+    idx[i] = p;
+  }
+
+  uint32_t id = strtoul(msg.substring(0, idx[0]).c_str(), NULL, 16);
+  String from = msg.substring(idx[0] + 1, idx[1]);
+  String to   = msg.substring(idx[1] + 1, idx[2]);
+  int ttl     = msg.substring(idx[2] + 1, idx[3]).toInt();
+  String type = msg.substring(idx[3] + 1, idx[4]);
+  String text = msg.substring(idx[4] + 1);
+
+  if (id == 0 || ttl < 1 || ttl > 10) return;
+  if (alreadySeen(id)) return;       // already handled -> stops loops
+  rememberID(id);
+
+  Serial.println("GOT   <- " + msg + "  (RSSI " + String(rssi) + ")");
+
+  bool sos = (type == "S");
+  bool forMe = (to == "ALL" || to == nodeId);
+
+  if (forMe) {
+    addMessage(from, text, sos, false, rssi);
+    if (sos) beep(3, 200); else beep(1, 80);
+  }
+
+  // Pass it forward so other devices can get it (not needed if it was only for me)
+  if (ttl > 1 && to != nodeId) {
+    String pkt = buildPacket(id, from, to, ttl - 1, sos ? "S" : "M", text);
+    queuePacket(pkt, random(300, 1500));   // random wait so devices do not collide
+  }
+}
+
+// ---------- Web handlers ----------
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE);
+}
+
+void handleSend() {
+  String text = clean(server.arg("text"), MAX_TEXT);
+  if (text.length() == 0) {
+    server.send(400, "text/plain", "Empty");
+    return;
+  }
+  bool sos = (server.arg("type") == "S");
+  sendMessage(server.arg("nm"), server.arg("to"), text, sos);
+  server.send(200, "text/plain", "Sent");
+}
+
+// Reply format:  first line  = NODEID <tab> latestNumber
+//                next lines  = number <tab> M/S <tab> mine(1/0) <tab> rssi <tab> from <tab> text
+void handlePoll() {
+  long since = server.arg("since").toInt();
+  if (since < 0 || since > (long)msgSeq) since = 0;
+  long start = since + 1;
+  long oldest = (long)msgSeq - MAX_MSG + 1;
+  if (start < oldest) start = oldest;
+
+  String out = nodeId + "\t" + String(msgSeq) + "\t" + (loraOk ? "1" : "0") + "\n";
+  for (long s = start; s <= (long)msgSeq; s++) {
+    Msg &m = msgs[(s - 1) % MAX_MSG];
+    out += String(s) + "\t" + (m.sos ? "S" : "M") + "\t" + (m.mine ? "1" : "0") + "\t" +
+           String(m.rssi) + "\t" + m.from + "\t" + m.text + "\n";
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", out);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Open http://192.168.4.1");
+}
+
+// ---------- SOS push button ----------
+void checkButton() {
+  static unsigned long lastPress = 0;
+  if (digitalRead(SOS_BTN_PIN) == LOW && millis() - lastPress > 5000) {
+    lastPress = millis();
+    sendMessage("Node", "ALL", "SOS! Need help", true);
+    beep(2, 150);
+  }
+}
+
+// ---------- Main ----------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(SOS_BTN_PIN, INPUT_PULLUP);
+
+  // Unique ID from the chip (last 2 bytes of MAC)
+  char b[5];
+  sprintf(b, "%04X", (unsigned int)(ESP.getChipId() & 0xFFFF));
+  nodeId = String(b);
+
+  // LoRa
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(LORA_FREQ)) {
+    LoRa.setSpreadingFactor(9);       // 7 = faster, 12 = longest range
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0xF3);
+    LoRa.enableCrc();
+    LoRa.setTxPower(17);
+    loraOk = true;
+    Serial.println("LoRa OK");
+  } else {
+    // WiFi will still start, so you can see the problem on the phone
+    Serial.println("LoRa FAILED. Check wiring, 3.3V and antenna.");
+    beep(3, 300);
+  }
+
+  // WiFi hotspot (open, so anyone nearby can join in an emergency)
+  String ssid = "DisasterNet-" + nodeId;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid.c_str());
+
+  server.on("/", handleRoot);
+  server.on("/send", handleSend);
+  server.on("/poll", handlePoll);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("=================================");
+  Serial.println("Node ID : " + nodeId);
+  Serial.println("WiFi    : " + ssid);
+  Serial.println("Open    : http://" + WiFi.softAPIP().toString());
+  Serial.println("=================================");
+  beep(1, 200);
+}
+
+void loop() {
+  server.handleClient();
+  receiveLoRa();
+  sendDueRelays();
+  checkButton();
+  delay(2);
+}
